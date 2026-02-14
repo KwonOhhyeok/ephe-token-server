@@ -11,7 +11,7 @@ app.add_middleware(
     allow_origins=[
         "https://talky.vivleap.com",
         # 개발용이 필요하면 추가:
-        # "http://localhost:5173",
+        "http://localhost:5173",
     ],
     allow_credentials=False,  # 쿠키 인증 안 쓰면 False
     allow_methods=["POST", "OPTIONS"],
