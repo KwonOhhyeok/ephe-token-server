@@ -1,18 +1,27 @@
 import os
+import logging
 import uuid
 import json
 from datetime import datetime, timedelta, timezone
 
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from datetime import datetime, timedelta, timezone
 
 import google.auth
 from google import genai
+from google.genai import types
 from google.cloud import storage
 from google.auth.transport.requests import Request
 
+
+logger = logging.getLogger("talky.api")
+if not logger.handlers:
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s [%(name)s] %(message)s",
+    )
 
 app = FastAPI()
 
@@ -195,3 +204,116 @@ def sign_read_url(session_id: str, req: SignUrlRequest):
     except Exception as e:
         print("read-url error:", repr(e))
         raise HTTPException(status_code=500, detail="Failed to sign read URL")
+
+
+class GenerateLessonRequest(BaseModel):
+    interest: str = Field(..., min_length=2, max_length=120)
+
+def _build_lesson_prompt(interest: str) -> str:
+    return f"""
+You are a news researcher. Find the most recent and trending news or issue
+about "{interest}" and write a lesson material in English, approximately
+300 characters.
+
+Format:
+- First line: title only
+- Second line onward: concise summary with key facts and different perspectives
+- Keep it discussion-friendly for an English conversation class
+- Plain text only (no markdown)
+""".strip()
+
+def _extract_text_from_response(resp) -> str:
+    chunks: list[str] = []
+    candidate_count = 0
+    part_count = 0
+
+    for cand in (getattr(resp, "candidates", None) or []):
+        candidate_count += 1
+        content = getattr(cand, "content", None)
+        parts = getattr(content, "parts", None) or []
+        part_count += len(parts)
+
+        for part in parts:
+            t = getattr(part, "text", None)
+            if isinstance(t, str) and t.strip():
+                chunks.append(t.strip())
+
+    if chunks:
+        merged = "\n".join(chunks).strip()
+        line_count = len([ln for ln in merged.splitlines() if ln.strip()])
+        logger.info(
+            "[generate-lesson] extracted from parts candidates=%d parts=%d chars=%d lines=%d",
+            candidate_count, part_count, len(merged), line_count
+        )
+        return merged
+
+    # parts가 없을 때만 fallback
+    fallback = getattr(resp, "text", None)
+    if isinstance(fallback, str) and fallback.strip():
+        text = fallback.strip()
+        line_count = len([ln for ln in text.splitlines() if ln.strip()])
+        logger.warning(
+            "[generate-lesson] fallback to response.text chars=%d lines=%d preview=%r",
+            len(text), line_count, text[:120]
+        )
+        return text
+
+    logger.warning(
+        "[generate-lesson] empty Gemini response candidates=%d",
+        candidate_count
+    )
+    return ""
+
+
+# 필요하면 상수로 분리
+LESSON_GEN_CONFIG = types.GenerateContentConfig(
+    temperature=0.6,
+    max_output_tokens=22000,  # curl과 동일. (운영에선 1024~4096로 낮추는 것 권장)
+    response_mime_type="text/plain",
+    thinking_config=types.ThinkingConfig(thinking_budget=10),
+)
+
+@app.post("/api/generate-lesson")
+def generate_lesson(req: GenerateLessonRequest):
+    try:
+        interest = req.interest.strip()
+        if not interest:
+            raise HTTPException(status_code=400, detail="interest is required")
+
+        prompt = _build_lesson_prompt(interest)
+
+        resp = client.models.generate_content(
+            model="gemini-2.5-flash",
+            contents=prompt,
+            config=LESSON_GEN_CONFIG,
+        )
+
+        # 디버깅 로그: 끊김 원인 추적용
+        cand0 = (getattr(resp, "candidates", None) or [None])[0]
+        finish_reason = getattr(cand0, "finish_reason", None) or getattr(cand0, "finishReason", None)
+        if hasattr(finish_reason, "name"):
+            finish_reason = finish_reason.name
+
+        usage = getattr(resp, "usage_metadata", None) or getattr(resp, "usageMetadata", None)
+        prompt_tokens = getattr(usage, "prompt_token_count", None) or getattr(usage, "promptTokenCount", None)
+        candidate_tokens = getattr(usage, "candidates_token_count", None) or getattr(usage, "candidatesTokenCount", None)
+        thoughts_tokens = getattr(usage, "thoughts_token_count", None) or getattr(usage, "thoughtsTokenCount", None)
+        total_tokens = getattr(usage, "total_token_count", None) or getattr(usage, "totalTokenCount", None)
+
+        logger.info(
+            "[generate-lesson] finish_reason=%s prompt=%s candidate=%s thoughts=%s total=%s",
+            finish_reason, prompt_tokens, candidate_tokens, thoughts_tokens, total_tokens
+        )
+
+        lesson_material = _extract_text_from_response(resp)
+        if not lesson_material:
+            raise HTTPException(status_code=502, detail="Empty response from Gemini")
+
+        return {"lessonMaterial": lesson_material}
+
+    except HTTPException:
+        raise
+    except Exception:
+        logger.exception("Generate lesson error")
+        raise HTTPException(status_code=500, detail="Failed to generate lesson")
+
